@@ -1,0 +1,46 @@
+{
+    "name": "ck-ms-queue",
+    "version": "0.1.0",
+    "description": "This package is a RabbitMQ queue management package prepared for use in CK applications or non-CK applications.",
+    "main": "dist/index.js",
+    "types": "dist/index.d.ts",
+    "files": [
+        "dist"
+    ],
+    "scripts": {
+        "build": "tsc",
+        "start": "node dist/src/index.js",
+        "dev": "ts-node-dev --transpile-only src/index.ts",
+        "test": "NODE_ENV=test jest"
+    },
+    "keywords": [
+        "CraftoKit",
+        "RabbitMQ",
+        "Queue",
+        "Management",
+        "CK",
+        "CraftoKit Team"
+    ],
+    "author": "CraftoKit Team - Mesut Kurak",
+    "license": "MIT",
+    "devDependencies": {
+        "@types/jest": "^29.5.13",
+        "@types/node": "^22.7.4",
+        "eslint": "^9.11.1",
+        "eslint-config-prettier": "^9.1.0",
+        "jest": "^29.7.0",
+        "jest-mock-extended": "^4.0.0-beta1",
+        "prettier": "^3.3.3",
+        "ts-jest": "^29.2.5",
+        "ts-node": "^10.9.2",
+        "ts-node-dev": "^2.0.0",
+        "typescript": "^5.6.2"
+    },
+    "dependencies": {
+        "ck-ms-di": "^1.0.10"
+    },
+    "repository": {
+        "type": "git",
+        "url": "https://github.com/mkurak/ck-ms-queue"
+    }
+}
