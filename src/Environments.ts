@@ -9,4 +9,5 @@ export const RABBITMQ_DEFAULT_CHANNEL_QUEUE_DURABLE = process.env.RABBITMQ_DEFAU
 export const RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE = process.env.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE || 'defaultRoute';
 export const RABBITMQ_DEFAULT_PREFETCH = parseInt(process.env.RABBITMQ_DEFAULT_PREFETCH || '1', 1);
 export const RABBITMQ_DEFAULT_COPYCOUNT = parseInt(process.env.RABBITMQ_DEFAULT_COPYCOUNT || '1', 1);
+export const RABBITMQ_RECONNECT_DELAY = parseInt(process.env.RABBITMQ_RECONNECT_DELAY || '1000', 1000);
 export const RABBITMQ_URI = process.env.RABBITMQ_URI || 'amqp://localhost';

@@ -1,56 +1,46 @@
 import amqplib, { Channel, Connection, ConsumeMessage } from 'amqplib';
 import * as Environments from './Environments';
+import { v4 as uuidv4 } from 'uuid';
 
 export type ExchangeType = 'direct' | 'topic' | 'fanout';
 
 export interface ChannelOptions {
-    name: string;
-    exchange: string;
-    type: ExchangeType;
-    queue: string;
-    route: string;
-    durable: boolean;
+    exchange?: string;
+    type?: ExchangeType;
+    queue?: string;
+    route?: string;
+    durable?: boolean;
+    prefetch?: number;
 }
 
 export interface ConsumerOptions {
-    channelName: string;
-    consumerName: string;
-    channelOptions?: ChannelOptions;
-    prefetch?: number;
+    channelOptions: ChannelOptions;
     copyCount?: number;
 }
 
-export interface Payload<T> {
-    message: T;
+export interface Consumer {
+    channel: Channel;
+    options: ConsumerOptions;
+    handler: (payload: Payload) => Promise<void>;
+}
+
+export interface Payload {
+    message: any;
     sessionId: string;
     ack: () => void;
     nack: () => void;
     reject: () => void;
 }
 
-export interface StoredChannelOptions {
-    channel: Channel;
-    options: ChannelOptions;
-}
-
-export interface StoredConsumerOptions<T> {
-    options: ConsumerOptions;
-    handler: (payload: Payload<T>) => Promise<void>;
-}
-
 export class QueueContainer {
     private connection: Connection | null = null;
-    private channels: Map<string, StoredChannelOptions> = new Map();
-    private channels_backup: Map<string, StoredChannelOptions> = new Map();
-    private consumers: Map<string, StoredConsumerOptions<any>> = new Map();
-    private consumers_backup: Map<string, StoredConsumerOptions<any>> = new Map();
+    private consumers: Map<string, Consumer> = new Map();
     private isConnected = false;
     private reconnectAttempts = 0;
     private maxReconnectAttempts = 5;
-    private readonly defaultChannelName = Environments.RABBITMQ_DEFAULT_CHANNEL_NAME;
     private uri = Environments.RABBITMQ_URI;
 
-    async connect(uri?: string) {
+    async connect(uri?: string): Promise<void> {
         if (uri) {
             this.uri = uri;
         }
@@ -69,175 +59,154 @@ export class QueueContainer {
                 this.reconnect();
             });
 
-            await this.addDefaultChannel();
+            this.connection.on('error', async (err: any) => {
+                this.isConnected = false;
+                console.error('Connection error:', err);
+                console.log('Connection lost unexpectedly. Trying to reconnect...');
+                this.reconnect();
+            });
         } catch (error) {
             console.error('RabbitMQ connection error:', error);
             this.reconnect();
         }
     }
 
-    private async reconnect() {
+    private async reconnect(): Promise<void> {
         if (this.reconnectAttempts < this.maxReconnectAttempts) {
             this.reconnectAttempts++;
             console.log('Reconnect attempt', this.reconnectAttempts);
             setTimeout(async () => {
                 try {
-                    this.channels_backup = new Map(this.channels);
-                    this.consumers_backup = new Map(this.consumers);
-
                     await this.connect(this.uri);
 
-                    this.channels_backup.forEach(async (channelOptions) => {
-                        await this.addChannel(channelOptions.options);
-                    });
+                    const copyConsumers = new Map(this.consumers);
+                    this.consumers.clear();
 
-                    this.consumers_backup.forEach(async (consumerOptions) => {
-                        await this.addConsumer(consumerOptions.options, consumerOptions.handler);
+                    copyConsumers.forEach(async (consumer) => {
+                        await consumer.channel.close();
+
+                        const channel = await this.addChannel(consumer.options.channelOptions);
+
+                        for (let i = 0; i < (consumer.options.copyCount ?? Environments.RABBITMQ_DEFAULT_COPYCOUNT); i++) {
+                            await this.addConsumerWithChannel(channel, consumer);
+                        }
                     });
                 } catch (error) {
                     console.error('Reconnect attempt failed:', error);
                     this.reconnect();
                 }
-            }, 5000);
+            }, Environments.RABBITMQ_RECONNECT_DELAY);
         } else {
             console.error('Max reconnect attempts reached. Shutting down.');
             this.shutdown();
         }
     }
 
-    private shutdown() {
+    public async shutdown(): Promise<void> {
         this.isConnected = false;
+
+        await this.connection?.close();
+
+        this.consumers.forEach(async (consumer) => {
+            await consumer.channel.close();
+        });
+
         this.connection = null;
-        this.channels.clear();
         this.consumers.clear();
     }
 
-    private async addDefaultChannel() {
+    async addChannel(options: ChannelOptions): Promise<Channel> {
         if (!this.isConnected) {
             throw new Error('RabbitMQ connection is not established');
-        }
-
-        if (this.channels.has(this.defaultChannelName)) {
-            console.log('Default channel already exists');
-            return;
         }
 
         const channel = await this.connection!.createChannel();
-        await channel.assertExchange(Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME, Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE, {
-            durable: Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_DURABLE,
+        await channel.assertExchange(options.exchange ?? Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME, options.type ?? Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE, {
+            durable: options.durable ?? Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_DURABLE,
         });
-        await channel.assertQueue(Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME, { durable: Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_DURABLE });
-        await channel.bindQueue(Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME, Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME, Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE);
+        await channel.assertQueue(options.queue ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME, { durable: options.durable ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_DURABLE });
+        await channel.bindQueue(
+            options.queue ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME,
+            options.exchange ?? Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME,
+            options.route ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE,
+        );
+        channel.prefetch(options.prefetch || Environments.RABBITMQ_DEFAULT_PREFETCH);
 
-        this.channels.set(this.defaultChannelName, {
-            channel,
-            options: {
-                name: this.defaultChannelName,
-                exchange: Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME,
-                type: Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE as ExchangeType,
-                queue: Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME,
-                route: Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE,
-                durable: Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_DURABLE,
-            },
-        });
-        console.log(`Default channel "${this.defaultChannelName}" created.`);
+        console.log(`Channel added.`, options);
+
+        return channel;
     }
 
-    async addChannel(options: ChannelOptions) {
+    async closeChannel(channel: Channel): Promise<void> {
         if (!this.isConnected) {
             throw new Error('RabbitMQ connection is not established');
         }
 
-        if (this.channels.has(options.name)) {
-            throw new Error(`Channel with name "${name}" already exists.`);
-        }
+        await channel.close();
 
-        const channel = await this.connection!.createChannel();
-        await channel.assertExchange(options.exchange, options.type, { durable: options.durable });
-        await channel.assertQueue(options.queue, { durable: options.durable });
-        await channel.bindQueue(options.queue, options.exchange, options.route);
-
-        this.channels.set(options.name, { channel, options });
-        console.log(`Channel "${name}" added and cached.`);
+        console.log('Channel closed', channel);
     }
 
-    async closeChannel(name: string) {
+    async addConsumerWithChannel(channel: Channel, consumer: Consumer) {
         if (!this.isConnected) {
             throw new Error('RabbitMQ connection is not established');
         }
-
-        const channelObj = this.channels.get(name);
-        if (!channelObj) {
-            throw new Error(`Channel with name "${name}" does not exist.`);
-        }
-
-        await this.removeConsumersByChannel(name);
-
-        await channelObj.channel.close();
-        this.channels.delete(name);
-        console.log(`Channel "${name}" and its consumers have been removed.`);
-    }
-
-    private async removeConsumersByChannel(channelName: string) {
-        if (!this.isConnected) {
-            throw new Error('RabbitMQ connection is not established');
-        }
-
-        for (const [consumerName, storedConsumer] of this.consumers) {
-            if (storedConsumer.options.channelName === channelName) {
-                const channel = this.channels.get(channelName)?.channel;
-                if (channel) {
-                    await channel.cancel(consumerName);
-                }
-
-                this.consumers.delete(consumerName);
-                console.log(`Consumer "${consumerName}" removed from channel "${channelName}".`);
-            }
-        }
-    }
-
-    async addConsumer<T>(options: ConsumerOptions, handler: (payload: Payload<T>) => Promise<void>) {
-        if (!this.isConnected) {
-            throw new Error('RabbitMQ connection is not established');
-        }
-
-        const channel = options.channelName ? this.channels.get(options.channelName)?.channel : await this.addChannel(options.channelOptions!);
 
         if (!channel) {
             throw new Error('Channel not found or failed to create.');
         }
 
-        channel.prefetch(options.prefetch || Environments.RABBITMQ_DEFAULT_PREFETCH);
-
-        const copyCount = options.copyCount || Environments.RABBITMQ_DEFAULT_COPYCOUNT;
-        for (let i = 0; i < copyCount; i++) {
-            await this.consumeMessage<T>(channel, options.consumerName, handler);
+        for (let i = 0; i < consumer.options.copyCount!; i++) {
+            await this.consumeMessage(consumer, consumer.handler);
         }
 
-        this.consumers.set(options.consumerName, { options, handler });
-        console.log(`Consumer "${options.consumerName}" added.`);
+        console.log(`Consumer added for channel.`, channel, consumer);
     }
 
-    private async consumeMessage<T>(channel: Channel, consumerName: string, handler: (payload: Payload<T>) => Promise<void>) {
-        await channel.consume(
-            consumerName,
-            async (msg: ConsumeMessage | null) => {
+    async addConsumer(options: ConsumerOptions, handler: (payload: Payload) => Promise<void>) {
+        if (!this.isConnected) {
+            throw new Error('RabbitMQ connection is not established');
+        }
+
+        const channel = await this.addChannel(options.channelOptions);
+
+        if (!channel) {
+            throw new Error('Channel not found or failed to create.');
+        }
+
+        options.copyCount = options.copyCount || Environments.RABBITMQ_DEFAULT_COPYCOUNT;
+
+        const consumer = { channel, options, handler } as Consumer;
+
+        this.consumers.set(uuidv4(), consumer);
+
+        for (let i = 0; i < options.copyCount; i++) {
+            await this.consumeMessage(consumer, handler);
+        }
+
+        console.log(`Consumer added.`, options);
+    }
+
+    private async consumeMessage(consumer: Consumer, handler: (payload: Payload) => Promise<void>) {
+        await consumer.channel.consume(
+            consumer.options.channelOptions.queue ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_NAME,
+            async (msg: any | null) => {
                 if (msg) {
                     let actionTaken = false;
 
-                    const payload: Payload<T> = {
+                    const payload: Payload = {
                         message: JSON.parse(msg.content.toString()),
                         sessionId: '',
                         ack: () => {
-                            channel.ack(msg);
+                            consumer.channel.ack(msg);
                             actionTaken = true;
                         },
                         nack: () => {
-                            channel.nack(msg);
+                            consumer.channel.nack(msg);
                             actionTaken = true;
                         },
                         reject: () => {
-                            channel.reject(msg);
+                            consumer.channel.reject(msg);
                             actionTaken = true;
                         },
                     };
@@ -258,5 +227,31 @@ export class QueueContainer {
             },
             { noAck: false },
         );
+    }
+
+    public async publishMessage(channel: ChannelOptions, message: any, options: any): Promise<void> {
+        if (!this.isConnected) {
+            throw new Error('RabbitMQ connection is not established');
+        }
+
+        try {
+            const channelInstance = await this.addChannel(channel);
+
+            channelInstance.publish(
+                channel.exchange ?? Environments.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME,
+                channel.route ?? Environments.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE,
+                Buffer.from(JSON.stringify(message)),
+                options,
+            );
+
+            console.log('Message published', message);
+        } catch (err: any) {
+            console.error('Error while publishing message:', err);
+            throw err;
+        }
+    }
+
+    public get isConnectedToRabbitMQ() {
+        return this.isConnected;
     }
 }
