@@ -48,14 +48,15 @@ export interface QueueContainerOptions {
     RABBITMQ_HOST?: string;
     RABBITMQ_PORT?: string;
     RABBITMQ_HEARTBEAT?: number;
+    RABBITMQ_VHOST?: string;
 }
 
 export class QueueContainer {
     private connection: Connection | null = null;
     private consumers: Map<string, Consumer> = new Map();
     private isConnected = false;
-    private reconnectAttempts = 0;
-    private maxReconnectAttempts = 5;
+    private isClosed = false;
+    private connectionError: string | undefined;
     private RABBITMQ_DEFAULT_CHANNEL_NAME: string = 'defaultChannel';
     private RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME: string = 'defaultExchange';
     private RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE: ExchangeType = 'direct';
@@ -72,12 +73,13 @@ export class QueueContainer {
     private RABBITMQ_HOST: string = 'localhost';
     private RABBITMQ_PORT: string = '5672';
     private RABBITMQ_HEARTBEAT: number = 60;
+    private RABBITMQ_VHOST: string = '/';
 
     constructor(options: QueueContainerOptions) {
         this.applyOptions(options);
     }
 
-    private applyOptions(options: QueueContainerOptions) {
+    public applyOptions(options: QueueContainerOptions) {
         this.RABBITMQ_DEFAULT_CHANNEL_NAME = options.RABBITMQ_DEFAULT_CHANNEL_NAME ?? process.env.RABBITMQ_DEFAULT_CHANNEL_NAME ?? this.RABBITMQ_DEFAULT_CHANNEL_NAME;
         this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME =
             options.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME ?? process.env.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME;
@@ -97,6 +99,7 @@ export class QueueContainer {
         this.RABBITMQ_HOST = options.RABBITMQ_HOST ?? process.env.RABBITMQ_HOST ?? this.RABBITMQ_HOST;
         this.RABBITMQ_PORT = options.RABBITMQ_PORT ?? process.env.RABBITMQ_PORT ?? this.RABBITMQ_PORT;
         this.RABBITMQ_HEARTBEAT = parseInt(options.RABBITMQ_HEARTBEAT?.toString() ?? process.env.RABBITMQ_HEARTBEAT ?? this.RABBITMQ_HEARTBEAT.toString(), 10);
+        this.RABBITMQ_VHOST = options.RABBITMQ_VHOST ?? process.env.RABBITMQ_VHOST ?? '/';
     }
 
     private async createConnection() {
@@ -109,13 +112,21 @@ export class QueueContainer {
             username: this.RABBITMQ_USERNAME,
             password: this.RABBITMQ_PASSWORD,
             heartbeat: this.RABBITMQ_HEARTBEAT,
+            vhost: this.RABBITMQ_VHOST ?? '/',
         });
+
+        if (!this.connection) {
+            throw new Error('Failed to create RabbitMQ connection');
+        }
+
         this.isConnected = true;
-        this.reconnectAttempts = 0;
         console.log('RabbitMQ connection established');
 
         this.connection.on('close', async () => {
             this.isConnected = false;
+            if (this.isClosed) {
+                return;
+            }
             console.log('Connection lost unexpectedly. Trying to reconnect...');
             this.reconnect();
         });
@@ -133,51 +144,75 @@ export class QueueContainer {
 
         try {
             await this.createConnection();
-        } catch (error) {
-            console.error('RabbitMQ connection error:', error);
-            this.reconnect();
+        } catch (error: any) {
+            if (error.code === 'ENOTFOUND') {
+                this.connectionError = 'ENOTFOUND';
+                await this.shutdown(true, true);
+                return;
+            }
+
+            await this.reconnect();
         }
     }
 
     private async reconnect(): Promise<void> {
-        if (this.reconnectAttempts < this.maxReconnectAttempts) {
-            this.reconnectAttempts++;
-            console.log('Reconnect attempt', this.reconnectAttempts);
-            setTimeout(async () => {
-                try {
-                    await this.createConnection();
+        await new Promise((resolve) => setTimeout(resolve, this.RABBITMQ_RECONNECT_DELAY));
 
-                    const copyConsumers = new Map(this.consumers);
-                    this.consumers.clear();
+        try {
+            const copyConsumers = new Map(this.consumers);
 
-                    copyConsumers.forEach(async (consumer) => {
-                        await consumer.channel.close();
+            await this.shutdown(true, true);
+            await this.createConnection();
 
-                        const channel = await this.addChannel(consumer.options.channelOptions);
+            copyConsumers.forEach(async (consumer) => {
+                const { options, handler } = consumer;
 
-                        for (let i = 0; i < (consumer.options.copyCount ?? this.RABBITMQ_DEFAULT_COPYCOUNT); i++) {
-                            await this.addConsumerWithChannel(channel, consumer);
-                        }
-                    });
-                } catch (error) {
-                    console.error('Reconnect attempt failed:', error);
-                    this.reconnect();
-                }
-            }, this.RABBITMQ_RECONNECT_DELAY);
-        } else {
-            console.error('Max reconnect attempts reached. Shutting down.');
-            this.shutdown();
+                await this.addConsumer(options, handler);
+            });
+        } catch (error: any) {
+            if (error.code === 'ENOTFOUND') {
+                this.connectionError = 'ENOTFOUND';
+                await this.shutdown(true, true);
+                return;
+            }
+            console.error('Reconnect attempt failed:', error);
+            await this.reconnect();
         }
     }
 
-    public async shutdown(): Promise<void> {
+    public async shutdown(deleteExchange: boolean = false, deleteQueue: boolean = false): Promise<void> {
         this.isConnected = false;
+        this.isClosed = true;
 
-        await this.connection?.close();
+        for (const consumer of this.consumers.values()) {
+            const { exchange, queue } = consumer.options.channelOptions;
 
-        this.consumers.forEach(async (consumer) => {
-            await consumer.channel.close();
-        });
+            if (deleteQueue && queue) {
+                try {
+                    await consumer.channel.deleteQueue(queue);
+                    console.log('Queue deleted:', queue);
+                } catch (error) {}
+            }
+
+            if (deleteExchange && exchange) {
+                try {
+                    await consumer.channel.deleteExchange(exchange);
+                    console.log('Exchange deleted:', exchange);
+                } catch (error) {}
+            }
+
+            try {
+                await consumer.channel.close();
+                console.log('Channel closed');
+            } catch (error) {}
+        }
+
+        if (this.connection) {
+            try {
+                await this.connection.close();
+                console.log('RabbitMQ connection closed');
+            } catch (error) {}
+        }
 
         this.connection = null;
         this.consumers.clear();
@@ -188,7 +223,7 @@ export class QueueContainer {
             throw new Error('RabbitMQ connection is not established');
         }
 
-        const channel = await this.connection!.createChannel();
+        const channel = await this.connection!.createConfirmChannel();
         await channel.assertExchange(options.exchange ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME, options.type ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE, {
             durable: options.durable ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_DURABLE,
         });
@@ -205,16 +240,6 @@ export class QueueContainer {
         return channel;
     }
 
-    async closeChannel(channel: Channel): Promise<void> {
-        if (!this.isConnected) {
-            throw new Error('RabbitMQ connection is not established');
-        }
-
-        await channel.close();
-
-        console.log('Channel closed', channel);
-    }
-
     async addConsumerWithChannel(channel: Channel, consumer: Consumer) {
         if (!this.isConnected) {
             throw new Error('RabbitMQ connection is not established');
@@ -224,11 +249,13 @@ export class QueueContainer {
             throw new Error('Channel not found or failed to create.');
         }
 
+        consumer.channel = channel;
+
         for (let i = 0; i < consumer.options.copyCount!; i++) {
             await this.consumeMessage(consumer, consumer.handler);
         }
 
-        console.log(`Consumer added for channel.`, channel, consumer);
+        console.log(`Consumer added for channel.`);
     }
 
     async addConsumer(options: ConsumerOptions, handler: (payload: Payload) => Promise<void>) {
@@ -280,6 +307,8 @@ export class QueueContainer {
                     };
 
                     try {
+                        console.log('Message received:', payload);
+
                         await handler(payload);
 
                         if (!actionTaken) {
@@ -303,16 +332,24 @@ export class QueueContainer {
         }
 
         try {
-            const channelInstance = await this.addChannel(channel);
+            const channelInstance = await this.connection!.createConfirmChannel();
 
-            channelInstance.publish(
-                channel.exchange ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME,
-                channel.route ?? this.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE,
-                Buffer.from(JSON.stringify(message)),
-                options,
-            );
-
-            console.log('Message published', message);
+            await new Promise<void>((resolve, reject) => {
+                channelInstance.publish(
+                    channel.exchange ?? this.RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME,
+                    channel.route ?? this.RABBITMQ_DEFAULT_CHANNEL_QUEUE_ROUTE,
+                    Buffer.from(JSON.stringify(message)),
+                    options,
+                    (err, ok) => {
+                        if (err) {
+                            console.error('Error while publishing message:', err);
+                            return reject(err);
+                        }
+                        console.log('Message published successfully');
+                        resolve();
+                    },
+                );
+            });
         } catch (err: any) {
             console.error('Error while publishing message:', err);
             throw err;
@@ -321,5 +358,13 @@ export class QueueContainer {
 
     public get isConnectedToRabbitMQ() {
         return this.isConnected;
+    }
+
+    public get isClosedConnection() {
+        return this.isClosed;
+    }
+
+    public get connectionErrorStatus() {
+        return this.connectionError;
     }
 }
