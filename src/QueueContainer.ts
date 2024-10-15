@@ -56,7 +56,8 @@ export class QueueContainer {
     private consumers: Map<string, Consumer> = new Map();
     private isConnected = false;
     private isClosed = false;
-    private connectionError: string | undefined;
+    private maxReconnectAttempts = 10;
+    private attempts = 0;
     private RABBITMQ_DEFAULT_CHANNEL_NAME: string = 'defaultChannel';
     private RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_NAME: string = 'defaultExchange';
     private RABBITMQ_DEFAULT_CHANNEL_EXCHANGE_TYPE: ExchangeType = 'direct';
@@ -145,37 +146,40 @@ export class QueueContainer {
         try {
             await this.createConnection();
         } catch (error: any) {
-            if (error.code === 'ENOTFOUND') {
-                this.connectionError = 'ENOTFOUND';
-                await this.shutdown(true, true);
-                return;
-            }
-
+            console.error('Failed to connect to RabbitMQ:', error);
             await this.reconnect();
         }
     }
 
     private async reconnect(): Promise<void> {
-        await new Promise((resolve) => setTimeout(resolve, this.RABBITMQ_RECONNECT_DELAY));
+        if (this.attempts >= this.maxReconnectAttempts) {
+            console.error('Max reconnect attempts reached. Shutting down...');
+            await this.shutdown();
+            return;
+        }
+
+        this.attempts++;
 
         try {
-            const copyConsumers = new Map(this.consumers);
+            await new Promise((resolve) => setTimeout(resolve, this.RABBITMQ_RECONNECT_DELAY));
 
-            await this.shutdown(true, true);
-            await this.createConnection();
+            try {
+                const copyConsumers = new Map(this.consumers);
 
-            copyConsumers.forEach(async (consumer) => {
-                const { options, handler } = consumer;
-
-                await this.addConsumer(options, handler);
-            });
-        } catch (error: any) {
-            if (error.code === 'ENOTFOUND') {
-                this.connectionError = 'ENOTFOUND';
                 await this.shutdown(true, true);
-                return;
+                await this.createConnection();
+
+                copyConsumers.forEach(async (consumer) => {
+                    const { options, handler } = consumer;
+
+                    await this.addConsumer(options, handler);
+                });
+            } catch (error: any) {
+                console.error('Reconnect attempt failed:', error);
+                await this.reconnect();
             }
-            console.error('Reconnect attempt failed:', error);
+        } catch (error: any) {
+            console.error('Error in reconnecting:', error);
             await this.reconnect();
         }
     }
@@ -364,7 +368,11 @@ export class QueueContainer {
         return this.isClosed;
     }
 
-    public get connectionErrorStatus() {
-        return this.connectionError;
+    public get getAttempts() {
+        return this.attempts;
+    }
+
+    public get getMaxReconnectAttempts() {
+        return this.maxReconnectAttempts;
     }
 }

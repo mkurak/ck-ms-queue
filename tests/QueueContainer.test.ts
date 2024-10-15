@@ -559,10 +559,10 @@ describe('QueueContainer', () => {
 
         await queueContainer.connect();
 
-        await new Promise((resolve) => setTimeout(resolve, 2000));
+        await new Promise((resolve) => setTimeout(resolve, 6000));
 
         expect(queueContainer.isConnectedToRabbitMQ).toBe(false);
         expect(queueContainer.isClosedConnection).toBe(true);
-        expect(queueContainer.connectionErrorStatus).toBe('ENOTFOUND');
+        expect(queueContainer.getAttempts).toBe(queueContainer.getMaxReconnectAttempts);
     });
 });
