@@ -1,6 +1,6 @@
 {
     "name": "ck-ms-queue",
-    "version": "0.5.2",
+    "version": "1.0.0",
     "description": "This package is a RabbitMQ queue management package prepared for use in CK applications or non-CK applications.",
     "main": "dist/index.js",
     "types": "dist/index.d.ts",
@@ -43,7 +43,8 @@
     "dependencies": {
         "amqplib": "^0.10.4",
         "axios": "^1.7.7",
-        "ck-ms-di": "^1.1.1",
+        "ck-ms-di": "^2.0.2",
+        "reflect-metadata": "^0.2.2",
         "uuid": "^10.0.0"
     },
     "repository": {

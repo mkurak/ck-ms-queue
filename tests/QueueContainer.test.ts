@@ -1,4 +1,6 @@
-import { ChannelOptions, Consumer, ConsumerOptions, Payload, QueueContainer, QueueContainerOptions } from '../src/QueueContainer';
+import { ServiceContainer } from 'ck-ms-di';
+import { ChannelOptions, ConsumerOptions, Payload, QueueContainer, QueueContainerOptions } from '../src/QueueContainer';
+import { Consumer } from '../src/decorators/Consumer';
 import axios from 'axios';
 
 const createRandomString = (length: number = 12): string => {
@@ -564,5 +566,57 @@ describe('QueueContainer', () => {
         expect(queueContainer.isConnectedToRabbitMQ).toBe(false);
         expect(queueContainer.isClosedConnection).toBe(true);
         expect(queueContainer.getAttempts).toBe(queueContainer.getMaxReconnectAttempts);
+    });
+
+    it('should create a consumer using a decorator and process the message', async () => {
+        const services = ServiceContainer.getInstance();
+
+        expect(services).toBeDefined();
+
+        const queueContainer = await services.resolveAsync<QueueContainer>('QueueContainer');
+
+        expect(queueContainer).toBeDefined();
+
+        const options: QueueContainerOptions = {
+            RABBITMQ_HOST: 'localhost',
+            RABBITMQ_PORT: '5672',
+            RABBITMQ_USERNAME: 'guest',
+            RABBITMQ_PASSWORD: 'guest',
+            RABBITMQ_VHOST: 'test',
+        };
+
+        queueContainer?.applyOptions(options);
+        await queueContainer?.shutdown(true, true);
+        await queueContainer?.connect();
+
+        const channelOptions: ChannelOptions = {
+            exchange: createRandomString(),
+            type: 'direct',
+            queue: createRandomString(),
+            route: createRandomString(),
+            durable: false,
+        };
+
+        const message = { text: 'Hello, RabbitMQ!' };
+
+        let consumedMessage: any = null;
+
+        class TestConsumer {
+            @Consumer({ channelOptions })
+            async consumeMessage(payload: Payload) {
+                consumedMessage = payload.message;
+                payload.ack();
+            }
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, 1000));
+
+        await queueContainer?.publishMessage(channelOptions, message, { persistent: false });
+
+        await new Promise((resolve) => setTimeout(resolve, 2000));
+
+        expect(consumedMessage).toEqual(message);
+
+        await queueContainer?.shutdown(true, true);
     });
 });

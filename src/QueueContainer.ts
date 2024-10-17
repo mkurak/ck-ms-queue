@@ -1,4 +1,5 @@
 import amqplib, { Channel, Connection } from 'amqplib';
+import { Service, ServiceContainer } from 'ck-ms-di';
 import { v4 as uuidv4 } from 'uuid';
 
 export type ExchangeType = 'direct' | 'topic' | 'fanout';
@@ -17,7 +18,7 @@ export interface ConsumerOptions {
     copyCount?: number;
 }
 
-export interface Consumer {
+interface Consumer {
     channel: Channel;
     options: ConsumerOptions;
     handler: (payload: Payload) => Promise<void>;
@@ -51,6 +52,7 @@ export interface QueueContainerOptions {
     RABBITMQ_VHOST?: string;
 }
 
+@Service({ lifecycle: 'singleton' })
 export class QueueContainer {
     private connection: Connection | null = null;
     private consumers: Map<string, Consumer> = new Map();
@@ -76,8 +78,10 @@ export class QueueContainer {
     private RABBITMQ_HEARTBEAT: number = 60;
     private RABBITMQ_VHOST: string = '/';
 
-    constructor(options: QueueContainerOptions) {
-        this.applyOptions(options);
+    constructor(options?: QueueContainerOptions) {
+        if (options) {
+            this.applyOptions(options);
+        }
     }
 
     public applyOptions(options: QueueContainerOptions) {
@@ -101,6 +105,10 @@ export class QueueContainer {
         this.RABBITMQ_PORT = options.RABBITMQ_PORT ?? process.env.RABBITMQ_PORT ?? this.RABBITMQ_PORT;
         this.RABBITMQ_HEARTBEAT = parseInt(options.RABBITMQ_HEARTBEAT?.toString() ?? process.env.RABBITMQ_HEARTBEAT ?? this.RABBITMQ_HEARTBEAT.toString(), 10);
         this.RABBITMQ_VHOST = options.RABBITMQ_VHOST ?? process.env.RABBITMQ_VHOST ?? '/';
+    }
+
+    public async init() {
+        await this.connect();
     }
 
     private async createConnection() {
@@ -293,9 +301,12 @@ export class QueueContainer {
                 if (msg) {
                     let actionTaken = false;
 
+                    const serviceContainer = ServiceContainer.getInstance();
+                    const sessionId = serviceContainer.beginSession();
+
                     const payload: Payload = {
                         message: JSON.parse(msg.content.toString()),
-                        sessionId: '',
+                        sessionId,
                         ack: () => {
                             consumer.channel.ack(msg);
                             actionTaken = true;
@@ -315,10 +326,13 @@ export class QueueContainer {
 
                         await handler(payload);
 
+                        serviceContainer.endSession(sessionId);
+
                         if (!actionTaken) {
                             payload.ack();
                         }
                     } catch (error) {
+                        serviceContainer.endSession(sessionId);
                         console.error('Consumer handler error:', error);
                         if (!actionTaken) {
                             payload.nack();
